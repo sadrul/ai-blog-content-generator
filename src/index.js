@@ -32,7 +32,8 @@ import {
 	edit, 
 	trash,
 	download,
-	upload
+	upload,
+	arrowRight
 } from '@wordpress/icons';
 
 /**
@@ -45,10 +46,12 @@ import './style.scss';
  */
 function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 	const [isGenerating, setIsGenerating] = useState(false);
-	const [generatedContent, setGeneratedContent] = useState('');
 	const [error, setError] = useState('');
 	const [selectedTemplate, setSelectedTemplate] = useState('');
 	const [showAdvanced, setShowAdvanced] = useState(false);
+	const [isInserting, setIsInserting] = useState(false);
+	const [successMessage, setSuccessMessage] = useState('');
+	const [autoInsert, setAutoInsert] = useState(false);
 	
 	const {
 		prompt = '',
@@ -57,7 +60,8 @@ function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 		length = 500,
 		content = '',
 		useTemplate = false,
-		templateId = ''
+		templateId = '',
+		lastGenerated = ''
 	} = attributes;
 
 	// Get available templates from WordPress
@@ -69,14 +73,12 @@ function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 		className: 'aibcg-content-generator'
 	});
 
-	// Inner blocks props for the content area
-	const innerBlocksProps = useInnerBlocksProps(
-		{ className: 'aibcg-generated-content' },
-		{
-			allowedBlocks: ['core/paragraph', 'core/heading', 'core/list', 'core/quote'],
-			template: [['core/paragraph', { content: '' }]]
-		}
-	);
+	// Get dispatch functions
+	const { replaceInnerBlocks, insertBlocks } = useDispatch(blockEditorStore);
+	const { getBlockIndex, getBlockOrder } = useSelect(select => ({
+		getBlockIndex: select(blockEditorStore).getBlockIndex,
+		getBlockOrder: select(blockEditorStore).getBlockOrder
+	}), []);
 
 	/**
 	 * Generate content using AI
@@ -87,8 +89,16 @@ function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 			return;
 		}
 
-		if (!settings.apiKey) {
-			setError(__('OpenAI API key not configured. Please configure it in the plugin settings.', 'ai-blog-content-generator'));
+		// Check if any AI provider is configured
+		const hasProvider = settings.provider && (
+			settings.provider === 'huggingface' || 
+			(settings.provider === 'openai' && settings.apiKey) ||
+			(settings.provider === 'google' && settings.googleKey) ||
+			settings.provider === 'ollama'
+		);
+
+		if (!hasProvider) {
+			setError(__('AI provider not configured. Please configure it in the plugin settings.', 'ai-blog-content-generator'));
 			return;
 		}
 
@@ -112,8 +122,18 @@ function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 			const data = await response.json();
 
 			if (data.success) {
-				setGeneratedContent(data.data.content);
+				// Replace existing content with new generated content
 				setAttributes({ content: data.data.content });
+				
+				// Show success message
+				if (autoInsert) {
+					setTimeout(() => {
+						// Auto-insert content after a short delay if user doesn't clear it
+						if (data.data.content.trim()) {
+							insertContentIntoPost();
+						}
+					}, 2000);
+				}
 			} else {
 				setError(data.data || __('An error occurred while generating content.', 'ai-blog-content-generator'));
 			}
@@ -121,6 +141,50 @@ function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 			setError(__('Network error. Please check your connection and try again.', 'ai-blog-content-generator'));
 		} finally {
 			setIsGenerating(false);
+		}
+	};
+
+	/**
+	 * Insert generated content into the main post content
+	 */
+	const insertContentIntoPost = async () => {
+		if (!content.trim()) {
+			setError(__('No content to insert. Please generate content first.', 'ai-blog-content-generator'));
+			return;
+		}
+
+		setIsInserting(true);
+		setError('');
+		setSuccessMessage('');
+
+		try {
+			// Create a paragraph block with the generated content
+			const { createBlock } = await import('@wordpress/blocks');
+			const paragraphBlock = createBlock('core/paragraph', {
+				content: content
+			});
+
+			// Get current block index
+			const currentBlockIndex = getBlockIndex(clientId);
+			
+			// Insert the paragraph block after the current AI generator block
+			insertBlocks(paragraphBlock, currentBlockIndex + 1);
+
+			// Clear the content from the generator block
+			setAttributes({ content: '' });
+			
+			// Show success message
+			setSuccessMessage(__('Content successfully inserted into your post!', 'ai-blog-content-generator'));
+			
+			// Clear success message after 3 seconds
+			setTimeout(() => {
+				setSuccessMessage('');
+			}, 3000);
+
+		} catch (err) {
+			setError(__('Failed to insert content into post.', 'ai-blog-content-generator'));
+		} finally {
+			setIsInserting(false);
 		}
 	};
 
@@ -138,24 +202,14 @@ function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 	};
 
 	/**
-	 * Insert generated content into editor
-	 */
-	const insertContent = () => {
-		if (generatedContent) {
-			// Replace the inner blocks with the generated content
-			const blocks = wp.blocks.parse(generatedContent);
-			// This would need to be implemented with the block editor's replaceInnerBlocks
-			setAttributes({ content: generatedContent });
-		}
-	};
-
-	/**
-	 * Clear generated content
+	 * Clear content
 	 */
 	const clearContent = () => {
-		setGeneratedContent('');
 		setAttributes({ content: '' });
 		setError('');
+		setSuccessMessage('');
+		// Clear inner blocks
+		replaceInnerBlocks(clientId, [], false);
 	};
 
 	return (
@@ -256,6 +310,15 @@ function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 								step={50}
 							/>
 						</div>
+						
+						<div className="aibcg-advanced-toggles">
+							<ToggleControl
+								label={__('Auto-insert content into post after generation', 'ai-blog-content-generator')}
+								help={__('Automatically insert generated content into your post after 2 seconds', 'ai-blog-content-generator')}
+								checked={autoInsert}
+								onChange={setAutoInsert}
+							/>
+						</div>
 					</div>
 				)}
 
@@ -288,49 +351,57 @@ function AIContentGeneratorBlock({ attributes, setAttributes, clientId }) {
 					</Notice>
 				)}
 
-				{/* Generated Content Display */}
-				{generatedContent && (
-					<div className="aibcg-generated-section">
-						<div className="aibcg-generated-header">
-							<h4>{__('Generated Content', 'ai-blog-content-generator')}</h4>
-							<div className="aibcg-generated-actions">
+				{/* Success Message */}
+				{successMessage && (
+					<Notice status="success" isDismissible={false}>
+						{successMessage}
+					</Notice>
+				)}
+
+				{/* Content Area */}
+				<div className="aibcg-content-area">
+					<div className="aibcg-content-header">
+						<h4>{__('Generated Content', 'ai-blog-content-generator')}</h4>
+						{content && (
+							<div className="aibcg-content-actions">
 								<Button
-									variant="secondary"
-									icon={download}
-									onClick={insertContent}
+									variant="primary"
+									icon={arrowRight}
+									onClick={insertContentIntoPost}
+									disabled={isInserting}
+									size="small"
+									className="aibcg-insert-btn"
 								>
-									{__('Insert into Editor', 'ai-blog-content-generator')}
+									{isInserting ? (
+										<>
+											<Spinner />
+											{__('Inserting...', 'ai-blog-content-generator')}
+										</>
+									) : (
+										__('Insert into Post', 'ai-blog-content-generator')
+									)}
 								</Button>
 								<Button
 									variant="secondary"
 									icon={trash}
 									onClick={clearContent}
+									size="small"
 								>
 									{__('Clear', 'ai-blog-content-generator')}
 								</Button>
 							</div>
-						</div>
-						<div className="aibcg-generated-content">
-							<RichText
-								value={generatedContent}
-								onChange={(value) => setGeneratedContent(value)}
-								placeholder={__('Generated content will appear here...', 'ai-blog-content-generator')}
-								tagName="div"
-								className="aibcg-content-preview"
-							/>
-						</div>
+						)}
 					</div>
-				)}
-
-				{/* Content Area for Inserted Content */}
-				{content && (
-					<div className="aibcg-content-area">
-						<div className="aibcg-content-header">
-							<h4>{__('Editor Content', 'ai-blog-content-generator')}</h4>
-						</div>
-						<div {...innerBlocksProps} />
+					<div className="aibcg-editor-content">
+						<RichText
+							value={content}
+							onChange={(value) => setAttributes({ content: value })}
+							placeholder={__('Generated content will appear here and can be edited before inserting into your post...', 'ai-blog-content-generator')}
+							tagName="div"
+							className="aibcg-content-editor"
+						/>
 					</div>
-				)}
+				</div>
 			</div>
 		</div>
 	);
@@ -352,7 +423,8 @@ registerBlockType('ai-blog-content-generator/content-generator', {
 	],
 	supports: {
 		html: false,
-		align: ['wide', 'full']
+		align: ['wide', 'full'],
+		reusable: false
 	},
 	attributes: {
 		prompt: {
@@ -382,6 +454,10 @@ registerBlockType('ai-blog-content-generator/content-generator', {
 		templateId: {
 			type: 'string',
 			default: ''
+		},
+		lastGenerated: {
+			type: 'string',
+			default: ''
 		}
 	},
 	edit: AIContentGeneratorBlock,
@@ -390,13 +466,12 @@ registerBlockType('ai-blog-content-generator/content-generator', {
 			className: 'aibcg-content-generator'
 		});
 
+		// Only save the block structure, not the generated content
+		// This prevents the content from being lost when editing
 		return (
 			<div {...blockProps}>
-				<div className="aibcg-generated-content">
-					{attributes.content && (
-						<div dangerouslySetInnerHTML={{ __html: attributes.content }} />
-					)}
-				</div>
+				{/* This block is for generating content only */}
+				{/* Generated content should be inserted as separate blocks */}
 			</div>
 		);
 	}

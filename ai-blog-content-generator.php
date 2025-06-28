@@ -108,8 +108,12 @@ class AI_Blog_Content_Generator {
 	 * Register plugin settings.
 	 */
 	public function register_settings() {
+		register_setting( 'aibcg_settings', 'aibcg_ai_provider', array( 'default' => 'huggingface' ) );
 		register_setting( 'aibcg_settings', 'aibcg_openai_api_key' );
-		register_setting( 'aibcg_settings', 'aibcg_default_model', array( 'default' => 'gpt-3.5-turbo' ) );
+		register_setting( 'aibcg_settings', 'aibcg_huggingface_api_key' );
+		register_setting( 'aibcg_settings', 'aibcg_google_api_key' );
+		register_setting( 'aibcg_settings', 'aibcg_ollama_url', array( 'default' => 'http://localhost:11434' ) );
+		register_setting( 'aibcg_settings', 'aibcg_default_model', array( 'default' => 'microsoft/DialoGPT-medium' ) );
 		register_setting( 'aibcg_settings', 'aibcg_max_tokens', array( 'default' => 1000 ) );
 		register_setting( 'aibcg_settings', 'aibcg_temperature', array( 'default' => 0.7 ) );
 		register_setting( 'aibcg_settings', 'aibcg_content_templates', array( 'default' => array() ) );
@@ -146,8 +150,11 @@ class AI_Blog_Content_Generator {
 			'ajaxUrl' => admin_url( 'admin-ajax.php' ),
 			'nonce' => wp_create_nonce( 'aibcg_nonce' ),
 			'settings' => array(
+				'provider' => get_option( 'aibcg_ai_provider', 'huggingface' ),
 				'apiKey' => get_option( 'aibcg_openai_api_key' ),
-				'model' => get_option( 'aibcg_default_model', 'gpt-3.5-turbo' ),
+				'huggingfaceKey' => get_option( 'aibcg_huggingface_api_key' ),
+				'googleKey' => get_option( 'aibcg_google_api_key' ),
+				'model' => get_option( 'aibcg_default_model', 'microsoft/DialoGPT-medium' ),
 				'maxTokens' => get_option( 'aibcg_max_tokens', 1000 ),
 				'temperature' => get_option( 'aibcg_temperature', 0.7 ),
 			),
@@ -197,23 +204,42 @@ class AI_Blog_Content_Generator {
 	 * @return string|WP_Error Generated content or error.
 	 */
 	private function generate_ai_content( $prompt, $content_type, $tone, $length ) {
+		$provider = get_option( 'aibcg_ai_provider', 'openai' );
+		
+		// Build the full prompt based on content type and parameters.
+		$full_prompt = $this->build_prompt( $prompt, $content_type, $tone, $length );
+		
+		switch ( $provider ) {
+			case 'openai':
+				return $this->generate_with_openai( $full_prompt );
+			case 'huggingface':
+				return $this->generate_with_huggingface( $full_prompt );
+			case 'google':
+				return $this->generate_with_google( $full_prompt );
+			case 'ollama':
+				return $this->generate_with_ollama( $full_prompt );
+			default:
+				return new WP_Error( 'invalid_provider', __( 'Invalid AI provider selected.', 'ai-blog-content-generator' ) );
+		}
+	}
+	
+	/**
+	 * Generate content using OpenAI.
+	 */
+	private function generate_with_openai( $prompt ) {
 		$api_key = get_option( 'aibcg_openai_api_key' );
 		
 		if ( empty( $api_key ) ) {
 			return new WP_Error( 'no_api_key', __( 'OpenAI API key not configured.', 'ai-blog-content-generator' ) );
 		}
 
-		// Build the full prompt based on content type and parameters.
-		$full_prompt = $this->build_prompt( $prompt, $content_type, $tone, $length );
-
-		// Make API request to OpenAI.
 		$response = wp_remote_post( 'https://api.openai.com/v1/chat/completions', array(
 			'headers' => array(
 				'Authorization' => 'Bearer ' . $api_key,
 				'Content-Type' => 'application/json',
 			),
 			'body' => json_encode( array(
-				'model' => get_option( 'aibcg_default_model', 'gpt-3.5-turbo' ),
+				'model' => get_option( 'aibcg_default_model', 'gpt-4-turbo' ),
 				'messages' => array(
 					array(
 						'role' => 'system',
@@ -221,7 +247,7 @@ class AI_Blog_Content_Generator {
 					),
 					array(
 						'role' => 'user',
-						'content' => $full_prompt,
+						'content' => $prompt,
 					),
 				),
 				'max_tokens' => get_option( 'aibcg_max_tokens', 1000 ),
@@ -238,7 +264,18 @@ class AI_Blog_Content_Generator {
 		$data = json_decode( $body, true );
 
 		if ( isset( $data['error'] ) ) {
-			return new WP_Error( 'api_error', $data['error']['message'] );
+			$error_message = $data['error']['message'];
+			
+			// Provide more helpful error messages for common issues
+			if ( strpos( $error_message, 'quota' ) !== false || strpos( $error_message, 'billing' ) !== false ) {
+				$error_message = __( 'API quota exceeded. Please check your OpenAI API billing and usage limits. ChatGPT Plus subscription does not include API access - you need a separate OpenAI API account.', 'ai-blog-content-generator' );
+			} elseif ( strpos( $error_message, 'invalid_api_key' ) !== false ) {
+				$error_message = __( 'Invalid API key. Please check your OpenAI API key in the plugin settings.', 'ai-blog-content-generator' );
+			} elseif ( strpos( $error_message, 'rate_limit' ) !== false ) {
+				$error_message = __( 'Rate limit exceeded. Please wait a moment and try again.', 'ai-blog-content-generator' );
+			}
+			
+			return new WP_Error( 'api_error', $error_message );
 		}
 
 		if ( ! isset( $data['choices'][0]['message']['content'] ) ) {
@@ -246,6 +283,146 @@ class AI_Blog_Content_Generator {
 		}
 
 		return $data['choices'][0]['message']['content'];
+	}
+	
+	/**
+	 * Generate content using Hugging Face (FREE).
+	 */
+	private function generate_with_huggingface( $prompt ) {
+		$api_key = get_option( 'aibcg_huggingface_api_key' );
+		$model = get_option( 'aibcg_default_model', 'microsoft/DialoGPT-medium' );
+		
+		// Hugging Face allows free usage without API key for some models
+		$headers = array( 'Content-Type' => 'application/json' );
+		if ( ! empty( $api_key ) ) {
+			$headers['Authorization'] = 'Bearer ' . $api_key;
+		}
+
+		$response = wp_remote_post( 'https://api-inference.huggingface.co/models/' . $model, array(
+			'headers' => $headers,
+			'body' => json_encode( array(
+				'inputs' => $prompt,
+				'parameters' => array(
+					'max_length' => get_option( 'aibcg_max_tokens', 1000 ),
+					'temperature' => get_option( 'aibcg_temperature', 0.7 ),
+					'do_sample' => true,
+				),
+			) ),
+			'timeout' => 60,
+		) );
+
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$body = wp_remote_retrieve_body( $response );
+		$data = json_decode( $body, true );
+
+		if ( isset( $data['error'] ) ) {
+			return new WP_Error( 'api_error', $data['error'] );
+		}
+
+		if ( ! isset( $data[0]['generated_text'] ) ) {
+			return new WP_Error( 'invalid_response', __( 'Invalid response from Hugging Face.', 'ai-blog-content-generator' ) );
+		}
+
+		return $data[0]['generated_text'];
+	}
+	
+	/**
+	 * Generate content using Google Gemini (FREE tier).
+	 */
+	private function generate_with_google( $prompt ) {
+		$api_key = get_option( 'aibcg_google_api_key' );
+		
+		if ( empty( $api_key ) ) {
+			return new WP_Error( 'no_api_key', __( 'Google API key not configured.', 'ai-blog-content-generator' ) );
+		}
+
+		$response = wp_remote_post( 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=' . $api_key, array(
+			'headers' => array( 'Content-Type' => 'application/json' ),
+			'body' => json_encode( array(
+				'contents' => array(
+					array(
+						'parts' => array(
+							array( 'text' => $prompt ),
+						),
+					),
+				),
+				'generationConfig' => array(
+					'maxOutputTokens' => get_option( 'aibcg_max_tokens', 1000 ),
+					'temperature' => get_option( 'aibcg_temperature', 0.7 ),
+				),
+			) ),
+			'timeout' => 60,
+		) );
+
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$body = wp_remote_retrieve_body( $response );
+		$data = json_decode( $body, true );
+
+		if ( isset( $data['error'] ) ) {
+			return new WP_Error( 'api_error', $data['error']['message'] );
+		}
+
+		if ( ! isset( $data['candidates'][0]['content']['parts'][0]['text'] ) ) {
+			return new WP_Error( 'invalid_response', __( 'Invalid response from Google Gemini.', 'ai-blog-content-generator' ) );
+		}
+
+		return $data['candidates'][0]['content']['parts'][0]['text'];
+	}
+	
+	/**
+	 * Generate content using Ollama (FREE - local).
+	 */
+	private function generate_with_ollama( $prompt ) {
+		// Ollama runs locally, so we need to check if it's available
+		$ollama_url = get_option( 'aibcg_ollama_url', 'http://localhost:11434' );
+		$model = get_option( 'aibcg_default_model', 'llama2' );
+		$temperature = floatval( get_option( 'aibcg_temperature', 0.7 ) );
+		$max_tokens = intval( get_option( 'aibcg_max_tokens', 1000 ) );
+		
+		// Debug info
+		error_log( "Ollama request - URL: $ollama_url, Model: $model, Temperature: $temperature, Max tokens: $max_tokens" );
+		
+		$request_body = array(
+			'model' => $model,
+			'prompt' => $prompt,
+			'stream' => false,
+			'options' => array(
+				'temperature' => $temperature,
+				'num_predict' => $max_tokens,
+			),
+		);
+		
+		$response = wp_remote_post( $ollama_url . '/api/generate', array(
+			'headers' => array( 'Content-Type' => 'application/json' ),
+			'body' => json_encode( $request_body ),
+			'timeout' => 120, // Longer timeout for local processing
+		) );
+
+		if ( is_wp_error( $response ) ) {
+			error_log( "Ollama connection error: " . $response->get_error_message() );
+			return new WP_Error( 'ollama_error', __( 'Ollama is not running. Please install and start Ollama on your server.', 'ai-blog-content-generator' ) );
+		}
+
+		$body = wp_remote_retrieve_body( $response );
+		$data = json_decode( $body, true );
+
+		if ( isset( $data['error'] ) ) {
+			error_log( "Ollama API error: " . $data['error'] );
+			return new WP_Error( 'api_error', $data['error'] );
+		}
+
+		if ( ! isset( $data['response'] ) ) {
+			error_log( "Ollama invalid response: " . print_r( $data, true ) );
+			return new WP_Error( 'invalid_response', __( 'Invalid response from Ollama.', 'ai-blog-content-generator' ) );
+		}
+
+		return $data['response'];
 	}
 
 	/**
@@ -328,10 +505,12 @@ register_activation_hook( __FILE__, 'aibcg_activate' );
  */
 function aibcg_activate() {
 	// Set default options.
-	add_option( 'aibcg_default_model', 'gpt-3.5-turbo' );
+	add_option( 'aibcg_ai_provider', 'huggingface' ); // Default to free option
+	add_option( 'aibcg_default_model', 'microsoft/DialoGPT-medium' ); // Default model for Hugging Face
 	add_option( 'aibcg_max_tokens', 1000 );
 	add_option( 'aibcg_temperature', 0.7 );
 	add_option( 'aibcg_content_templates', array() );
+	add_option( 'aibcg_ollama_url', 'http://localhost:11434' );
 }
 
 // Deactivation hook.
